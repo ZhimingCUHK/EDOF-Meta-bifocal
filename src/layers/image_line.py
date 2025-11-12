@@ -1,224 +1,203 @@
 import torch
+import math
+from torch.nn import functional as F
 from torch import Tensor
 from typing import Tuple
 
-def img_psf_conv_torch(img: Tensor,
-                       psf: Tensor,
-                       otf: Tensor=None,
-                       adjoint: bool = False,
-                       return_otf: bool = False):
-    """
-    Return:
-    y(blur images):[B,K,H,W,C]
-    otf:psf-->otf,as big as after padding img
-    """
-    added_B = False
-    if img.dim() == 3:
-        img = img[None, :, :, :]
-        added_B = True
-    B, H, W, C = img.shape
 
-    added_K = False
-    if psf.dim() == 3:
-        psf = psf[None,:,:,:]
-        added_K = True
-    K,h,w,C_psf = psf.shape
-    assert C_psf == C
+def img_psf_conv_torch_bchw(img: Tensor, psf: Tensor):
+    """ 
+    Using FFT to convolve image with PSF
+    Args:
+    img(Tensor): [B,C,H,W] input image
+    psf(Tensor): [K,C,h,w] PSF kernels
+    Returns:
+    convolved_img(Tensor): [B,C,H,W] convolved image
+    """
+    B, C, H, W = img.shape
+    K, C_psf, h, w = psf.shape
+    assert C == C_psf, "Channel number of img and psf must be the same"
 
     device = img.device
-    fdtype = img.real.dtype if img.is_complex() else img.dtype
+    dtype = img.dtype
 
-    H2,W2 = 2*H,2*W
-    img_pad = torch.zeros((B,H2,W2,C),device=device,dtype=fdtype)
-    img_pad[:,:H,:W,:] = img
+    H2, W2 = 2 * H, 2 * W  # zero-padding to avoid circular convolution
+    img_pad = F.pad(img, (0, W, 0, H), mode='constant', value=0)
 
-    #prepare OTF
-    if otf is None:
-        otf = psf2otf_torch(psf.to(device=device,dtype=fdtype),H2,W2)
-    if otf.dim() == 3:
-        otf = otf.unsqueeze(0)
+    # calculating the otf
+    otf = psf2otf_torch_bchw(psf.to(device=device, dtype=dtype), H2, W2)
 
-    IMG_F = torch.fft.fft2(img_pad,dim=(1,2))
-    OTF_F = otf.to(device=IMG_F.device,dtype=IMG_F.dtype)
-    if adjoint:
-        OTF_F = torch.conj(OTF_F)
+    # FFT the image
+    img_f = torch.fft.fft2(img_pad, dim=(-2, -1))
 
-    # for broadcasting
-    Y_F = IMG_F[:,None,:,:,:] * OTF_F[None,:,:,:,:]
+    # the image(after fft) times the otf
+    # img_f:[B,1,C,H2,W2]
+    # otf:[1,K,C,H2,W2]
+    # Y_F:[B,K,C,H2,W2]
+    Y_F = img_f.unsqueeze(1) * otf.unsqueeze(0)
 
-    y_big = torch.fft.ifft2(Y_F,dim=(2,3)).real
+    y_big = torch.fft.ifft(Y_F, dim=(-2, -1)).real
 
-    blurred_img = y_big[:,:,:H,:W,:]
+    blurred_img = y_big[..., :H, :W]
 
-    if added_K:
-        blurred_img = blurred_img[:,0,:,:,:]
-    if added_B:
-        blurred_img = blurred_img[0,:,:,:,:]
-
-    if return_otf:
-        return blurred_img,otf
     return blurred_img
 
-def psf2otf_torch(psf: Tensor, out_h: int, out_w: int):
-    added_K = False
-    if psf.dim() == 3:
-        psf = psf[None, :, :, :]
-        added_K = True
-
-    K, H, W, C = psf.shape
+def psf2otf_torch_bchw(psf: Tensor, out_h: int, out_w: int):
+    """ 
+    (B,C,H,W)
+    Make PSF [K,C,h,w] to OTF [K,C,out_h,out_w]
+    The center of PSF should be at (h // 2, w // 2)
+    """
+    K, C, H, W = psf.shape
     device = psf.device
     dtype = psf.dtype
 
-    def ifftshift2d(x):
-        return torch.roll(torch.roll(x, shifts=(-H // 2), dims=1),
-                          shifts=(-W // 2),
-                          dims=2)
+    # pad the psf to out_h, out_w
+    pad_top = (out_h - H) // 2
+    pad_bottom = out_h - H - pad_top
+    pad_left = (out_w - W) // 2
+    pad_right = out_w - W - pad_left
 
-    psf_shifted = ifftshift2d(psf)
+    psf_padded = F.psf(psf, (pad_left, pad_right, pad_top, pad_bottom),
+                       'constant', 0)
 
-    otf_pad = torch.zeros((K, out_h, out_w, C), device=device, dtype=dtype)
-    otf_pad[:, :H, :W, :] = psf_shifted
+    # fftshift the psf
+    psf_shifted = torch.roll(psf_padded,
+                             shifts=(-H // 2, -W // 2),
+                             dims=(2, 3))
 
-    otf = torch.fft.fft2(otf_pad, dim=(1, 2))
-
-    if added_K:
-        otf = otf[0]
+    # compute the OTF
+    otf = torch.fft.fft2(psf_shifted, dim=(2, 3))
 
     return otf
 
 
-def matting_torch(depthmap: Tensor,
-                  n_depths: int,
-                  binary: bool,
-                  eps: float = 1e-8):
+def matting_torch_bchw(depthmap: Tensor, n_depths: int, binary: bool):
     """ 
+    (B,C,H,W)
     Args:
-    Input:
-    depthmap:
-        [B,1,1,H,W] or [B,1,H,W] or [1,H,W]
-    n_depths:K depth layers
-    binary:True -> one-hot
-    Output:
-    alpha:[B,1,K,H,W]
+    depthmap(Tensor):[B,1,H,W]
+    n_depths(int):K the number of depths
+    binary(bool):True -> one-hot
+    Returns:
+    layered_depth(Tensor):[B,1,K,H,W]
     """
     x = depthmap
-    if x.dim() == 3:
-        x = x.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    elif x.dim() == 4:
-        if x.shape[1] != 1:
-            x = x.unsqueeze(1)
-        x = x.unsqueeze(2)
-    elif x.dim() == 5:
-        pass
-    else:
-        raise ValueError("depthmap should be 3D/4D/5D tensor")
+    if x.dim() != 4 or x.shape[1] != 1:
+        raise ValueError("depthmap should be with shape [B,1,H,W]")
+    B,_,H,W = x.shape
+    device,dtype = x.device, x.dtype
+    x = torch.clamp(x,min=1e-8,max=1.0)
 
-    device, dtype = x.device, x.dtype
+    # (K,1,1)
+    d = torch.arange(1,n_depths+1,device=device,dtype=dtype).view(-1,1,1)
 
-    x = torch.clamp(x, min=eps, max=1)
+    # (1,H,W)
+    x_scaled = (x * float(n_depths)).squeeze(1)
 
-    d = torch.arange(1, n_depths + 1, device=device,
-                     dtype=dtype).view(1, 1, -1, 1, 1)
-
-    x_scaled = x * float(n_depths)
-    diff = d - x_scaled
-
-    alpha = torch.zeros_like(diff)
+    # using broadcasting to get layered depth
+    diff = x_scaled.unsqueeze(0) - d.unsqueeze(1)  # (K,H,W)
 
     if binary:
         logi = (diff >= 0.) & (diff < 1.)
-        alpha = torch.where(logi, torch.ones_like(diff),
-                            torch.zeros_like(diff))
+        alpha = torch.where(logi,torch.ones_like(diff),torch.zeros_like(diff))
     else:
-        mask_left = (diff > -1.) & (diff <= 0.)
-        alpha[mask_left] = diff[mask_left] + 1.0
-        mask_right = (diff > 0.) & (diff <= 1.)
-        alpha[mask_right] = 1.0
-    return alpha
+        raise NotImplementedError("Only binary=True is implemented.")
+
+    return alpha.unsqueeze(1) # (B,K,1,H,W)
+
+def over_op_torch_bchw(alpha:Tensor):
+    """
+    (B,C,H,W)
+
+    Args:
+    alpha(Tensor):[B,K,1,H,W]
+    
+    Returns:
+    T_before(Tensor):[B,K,1,H,W]
+    """
+    alpha_permuted = alpha.permute(0,2,3,4,1)
+
+    one_minus = (1 - alpha_permuted).clamp(0, 1)
+    T_after = torch.cumprod(one_minus, dim=-1)
+
+    ones_slice = torch.ones_like(alpha_permuted[:,:,:,:,0:1])
+    T_shift = T_after[:,:,:,:,:-1]
+    T_before = torch.cat([ones_slice,T_shift],dim=-1)
+
+    return T_before.permute(0,4,1,2,3)
 
 
-def depthmap_to_layer_depth_torch(depthmap: Tensor, n_depths: int,
-                                  binary: False):
-    layered_depth = matting_torch(depthmap, n_depths, binary=binary)
-    return layered_depth
-
-
-def over_op_torch(alpha: Tensor):
-    one_minus = (1 - alpha).clamp(0, 1)
-    T_after = torch.cumprod(one_minus, dim=2)
-    ones_slice = torch.ones_like(alpha[:, :, 0:1, :, :])
-    T_shift = T_after[:, :, :-1, :, :]
-    T_before = torch.cat([ones_slice, T_shift], dim=2)
-    return T_before
-
-
-def capture_img_torch(img: Tensor, depthmap: Tensor, psfs: Tensor,
-                      scene_distances: Tensor):  # generate sensor img
-    occlusion = True
+def capture_img_torch_bchw(img: Tensor, depthmap: Tensor, psfs: Tensor):
+    """
+    (B,C,H,W)
+    simulate the captured image by sensor
+    Args:
+        img:Tensor:the clean image [B,C,H,W]
+        depthmap:Tensor:the depthmap [B,1,H,W]
+        psfs:Tensor:the PSF kernels [K,C,h,w]
+    Returns:
+        Tensor:the captured image [B,C,H,W]
+    """
     eps = 1e-3
-    B, H, W, C = img.shape
+    B, C, H, W = img.shape
     K = psfs.shape[0]
     device = img.device
     dtype = img.dtype
-    depthmap = depthmap.to(device=device, dtype=dtype)
-    psfs = psfs.to(device=device, dtype=dtype)
 
-    # depth mapping
-    layered_alpha = matting_torch(depthmap, len(scene_distances), binary=True)
-    layered_alpha_rgb = layered_alpha.repeat(1, C, 1, 1, 1)
+    # depth mapping [B,1,H,W] -> [B,K,1,H,W]
+    layered_alpha = matting_torch_bchw(depthmap, K, binary=True)
 
-    # mapping rgb
-    img_k = img.unsqueeze(1).repeat(1, K, 1, 1, 1)
-    volume = layered_alpha_rgb.permute(0, 2, 3, 4, 1) * img_k
-    scale = volume.max()
-    volume = volume / (scale + 1e-12)
+    # rgb mapping [B,C,H,W] -> [B,K,C,H,W]
+    volume = img.unsqueeze(1) * layered_alpha
 
     # conv in different layers
     blurred_volume = torch.zeros_like(volume)
-    blurred_alpha_rgb = torch.zeros_like(volume)
+    blurred_alpha = torch.zeros_like(layered_alpha)
+
+    psf_alpha = psfs[:, 0:1, :, :]  # [K,1,h,w]
 
     for k in range(K):
-        vol_k = volume[:, k]
-        layered_alpha_k_rgb = layered_alpha_rgb[:, :, k].permute(0, 2, 3, 1)
-        psf_k = psfs[k:k + 1]
+        vol_k = volume[:, k, :, :]
+        psf_k = psfs[k:k + 1, :, :, :]
+        blurred_k = img_psf_conv_torch_bchw(vol_k, psf_k).squeeze(1)
+        blurred_volume[:, k, :, :] = blurred_k
 
-        blurred_k = img_psf_conv_torch(vol_k, psf_k)[:, 0]
-        blurred_alpha_k = img_psf_conv_torch(layered_alpha_k_rgb, psf_k)[:, 0]
+        # convolve alpha
+        alpha_k = layered_alpha[:, k, :, :]
+        psf_k = psf_alpha[k:k + 1, :, :, :]
+        blurred_alpha_k = img_psf_conv_torch_bchw(alpha_k, psf_k).squeeze(1)
+        blurred_alpha[:, k, :, :] = blurred_alpha_k
 
-        blurred_volume[:, k] = blurred_k
-        blurred_alpha_rgb[:, k] = blurred_alpha_k
+    # alpha cumulative product
+    cumsum_alpha_permuted = torch.flip(torch.cumsum(torch.flip(
+        layered_alpha.permute(0, 2, 3, 4, 1), dims=[-1]),
+                                                    dim=-1),
+                                       dims=[-1])
+    cumsum_alpha = cumsum_alpha_permuted.permute(0, 5, 1, 2, 3)
 
-    cumsum_alpha = torch.flip(torch.cumsum(torch.flip(layered_alpha, dims=[2]),
-                                           dim=2),
-                              dims=[2])
-    E = torch.zeros((B, K, H, W, C), device=device, dtype=dtype)
+    E = torch.zeros_like(blurred_volume)
     for k in range(K):
-        ca_k = cumsum_alpha[:, 0, k]
-        ca_k_c = ca_k.unsqueeze(-1).repeat(1, 1, 1, C)
-        psf_k = psfs[k:k + 1]
-        E_k = img_psf_conv_torch(ca_k_c, psf_k)[:, 0]
-        E[:, k] = E_k
+        ca_k = cumsum_alpha[:, k, :, :]
+        psf_k = psf_alpha[k:k + 1, :, :, :]
+        E_k = img_psf_conv_torch_bchw(ca_k, psf_k).squeeze(1)
+        E[:, k, :, :] = E_k
 
     C_tilde = blurred_volume / (E + eps)
-    A_tilde = blurred_alpha_rgb / (E + eps)
+    A_tilde = blurred_alpha.repeat(1, 1, C, 1, 1) / (E + eps)
 
-    T_before = over_op_torch(A_tilde)
+    T_before = over_op_torch_bchw(A_tilde[:, :, 0:1, :, :])
 
     captimg = (C_tilde * T_before).sum(dim=1)
-    captimg = captimg * (scale + 1e-12)
-    volume = volume * (scale + 1e-12)
 
-    if not occlusion:
-        sensor_stack = torch.zeros_like(volume)
-        for k in range(K):
-            captimg = sensor_stack.sum(dim=1)
-            captimg = captimg * (scale + 1e-12)
-            volume = volume * (scale + 1e-12)
-            return captimg, volume
+    return captimg
 
-    return captimg, volume
-
-def sensor_noise_torch(x:Tensor,a_poisson:float,b_sqrt:float,clip:Tuple[float,float] = (1e-6,1.0),poisson_max:float=100,sample_poisson:bool = False):
+def sensor_noise_torch(x: Tensor,
+                       a_poisson: float,
+                       b_sqrt: float,
+                       clip: Tuple[float, float] = (1e-6, 1.0),
+                       poisson_max: float = 100,
+                       sample_poisson: bool = False):
     """ 
     Args:
     x:captured image by sensor
@@ -229,20 +208,22 @@ def sensor_noise_torch(x:Tensor,a_poisson:float,b_sqrt:float,clip:Tuple[float,fl
     """
     device = x.device
     dtype = x.dtype
-    low,high = clip
+    low, high = clip
 
     # -- Shot Noise (Poisson) --
     if a_poisson > 0.0:
-        x_clamped = x.clamp(min=low,max=poisson_max)
+        x_clamped = x.clamp(min=low, max=poisson_max)
 
         if sample_poisson:
             with torch.no_grad():
-                lam = (x_clamped/float(a_poisson)).to(dtype=dtype,device=device)
+                lam = (x_clamped / float(a_poisson)).to(dtype=dtype,
+                                                        device=device)
                 counts = torch.poisson(lam)
-            shot = counts*float(a_poisson)
+            shot = counts * float(a_poisson)
         else:
             # Poisson(λ) ~ λ + sqrt(λ) * N(0,1)
-            noise_shot = torch.randn_like(x_clamped) * torch.sqrt((x_clamped*float(a_poisson)).clamp_min(0.0))
+            noise_shot = torch.randn_like(x_clamped) * torch.sqrt(
+                (x_clamped * float(a_poisson)).clamp_min(0.0))
             shot = x_clamped + noise_shot
         y = shot
     else:
@@ -250,9 +231,8 @@ def sensor_noise_torch(x:Tensor,a_poisson:float,b_sqrt:float,clip:Tuple[float,fl
 
     # -- Readout Noise (Gaussian) --
     if b_sqrt > 0.0:
-        y = y + torch.randn_like(y)*float(b_sqrt)
+        y = y + torch.randn_like(y) * float(b_sqrt)
 
     # -- clipping --
-    y = y.clamp(min=low,max=high)
+    y = y.clamp(min=low, max=high)
     return y
-    
