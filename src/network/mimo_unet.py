@@ -42,20 +42,24 @@ class AFF(nn.Module):
 
 
 class SCM(nn.Module):
-    def __init__(self, out_plane):
+    def __init__(self, out_plane, in_channel=3):
         super(SCM, self).__init__()
+        self.in_channel = in_channel
+        self.out_plane = out_plane
         self.main = nn.Sequential(
-            BasicConv(3, out_plane//4, kernel_size=3, stride=1, relu=True),
+            BasicConv(in_channel, out_plane//4, kernel_size=3, stride=1, relu=True),
             BasicConv(out_plane // 4, out_plane // 2, kernel_size=1, stride=1, relu=True),
             BasicConv(out_plane // 2, out_plane // 2, kernel_size=3, stride=1, relu=True),
-            BasicConv(out_plane // 2, out_plane-3, kernel_size=1, stride=1, relu=True)
+            BasicConv(out_plane // 2, out_plane-in_channel, kernel_size=1, stride=1, relu=True)
         )
 
         self.conv = BasicConv(out_plane, out_plane, kernel_size=1, stride=1, relu=False)
 
     def forward(self, x):
-        x = torch.cat([x, self.main(x)], dim=1)
-        return self.conv(x)
+        main_out = self.main(x)
+        cat_out = torch.cat([x, main_out], dim=1)
+        # print(f"SCM Debug: in_shape={x.shape}, main_out_shape={main_out.shape}, cat_shape={cat_out.shape}, expected_out={self.out_plane}, init_in_channel={self.in_channel}")
+        return self.conv(cat_out)
 
 
 class FAM(nn.Module):
@@ -114,9 +118,9 @@ class MIMOUNet(nn.Module):
         ])
 
         self.FAM1 = FAM(base_channel * 4)
-        self.SCM1 = SCM(base_channel * 4)
+        self.SCM1 = SCM(base_channel * 4, in_channel=in_channel)
         self.FAM2 = FAM(base_channel * 2)
-        self.SCM2 = SCM(base_channel * 2)
+        self.SCM2 = SCM(base_channel * 2, in_channel=in_channel)
 
     def forward(self, x):
         x_2 = F.interpolate(x, scale_factor=0.5)
@@ -209,9 +213,9 @@ class MIMOUNetPlus(nn.Module):
         ])
 
         self.FAM1 = FAM(base_channel * 4)
-        self.SCM1 = SCM(base_channel * 4)
+        self.SCM1 = SCM(base_channel * 4, in_channel=in_channel)
         self.FAM2 = FAM(base_channel * 2)
-        self.SCM2 = SCM(base_channel * 2)
+        self.SCM2 = SCM(base_channel * 2, in_channel=in_channel)
 
         self.drop1 = nn.Dropout2d(0.1)
         self.drop2 = nn.Dropout2d(0.1)

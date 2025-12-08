@@ -9,6 +9,15 @@ import os
 import time
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+try:
+    from skimage.metrics import structural_similarity as compare_ssim
+    from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+except ImportError:
+    print("Warning: scikit-image not installed. Metrics will be 0.")
+    compare_ssim = None
+    compare_psnr = None
+
 from src.models.pipeline import ImageFormationPipeline
 from src.data.dataloader import SceneFlowDataset
 from src.network.mimo_unet import build_net
@@ -25,6 +34,26 @@ def tensor_to_image(tensor):
     else:
         img = img.transpose(1, 2, 0)
     return np.clip(img, 0, 1)
+
+def calculate_metrics(img1, img2):
+    """
+    Calculate PSNR and SSIM for a pair of images.
+    img1, img2: [C, H, W] tensors, range [0, 1]
+    """
+    if compare_psnr is None or compare_ssim is None:
+        return 0.0, 0.0
+        
+    img1_np = img1.detach().cpu().numpy().transpose(1, 2, 0)
+    img2_np = img2.detach().cpu().numpy().transpose(1, 2, 0)
+    
+    psnr = compare_psnr(img1_np, img2_np, data_range=1.0)
+    # Handle channel_axis for newer skimage versions, or multichannel for older
+    try:
+        ssim = compare_ssim(img1_np, img2_np, data_range=1.0, channel_axis=2)
+    except TypeError:
+        ssim = compare_ssim(img1_np, img2_np, data_range=1.0, multichannel=True)
+        
+    return psnr, ssim
 
 class MultiScaleLoss(nn.Module):
     def __init__(self):
@@ -55,14 +84,15 @@ def save_checkpoint(model, optimizer, epoch, save_path):
         'optimizer_state_dict': optimizer.state_dict(),
     }, save_path)
 
-def validate_and_visualize(pipeline, model, val_loader, device, epoch, output_dir):
+def validate_and_visualize(pipeline, model, val_loader, device, epoch, output_dir, writer=None):
     model.eval()
     pipeline.eval() # Pipeline usually doesn't have BN/Dropout but good practice
     
+    psnr_list = []
+    ssim_list = []
+
     with torch.no_grad():
-        try:
-            # Get one batch for visualization
-            rgb_gt, _, depth_map = next(iter(val_loader))
+        for i, (rgb_gt, _, depth_map) in enumerate(val_loader):
             rgb_gt = rgb_gt.to(device)
             depth_map = depth_map.to(device)
             
@@ -70,52 +100,71 @@ def validate_and_visualize(pipeline, model, val_loader, device, epoch, output_di
             raw_output, img_near, img_far = pipeline(rgb_gt, depth_map)
             
             # 2. Reconstruct
-            # raw_output is [B, 1, H, W], model expects [B, 1, H, W]
             preds = model(raw_output)
             pred_img = preds[2] # Full resolution output
             
-            # 3. Visualize
-            B = rgb_gt.shape[0]
-            idx = 0 # Show first image in batch
+            # Calculate metrics
+            for b in range(rgb_gt.shape[0]):
+                p, s = calculate_metrics(rgb_gt[b], pred_img[b])
+                psnr_list.append(p)
+                ssim_list.append(s)
+
+            # 3. Visualize (Only for the first batch)
+            if i == 0:
+                B = rgb_gt.shape[0]
+                idx = 0 # Show first image in batch
+                
+                fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+                
+                # Row 1: Inputs
+                axes[0,0].imshow(tensor_to_image(rgb_gt[idx]))
+                axes[0,0].set_title("GT Sharp Image")
+                axes[0,0].axis('off')
+                
+                depth_vis = depth_map[idx].detach().cpu().squeeze().numpy()
+                im = axes[0,1].imshow(depth_vis, cmap='plasma')
+                axes[0,1].set_title("Depth Map")
+                axes[0,1].axis('off')
+                plt.colorbar(im, ax=axes[0,1], fraction=0.046, pad=0.04)
+                
+                raw_vis = raw_output[idx].detach().cpu().squeeze().numpy()
+                axes[0,2].imshow(raw_vis, cmap='gray')
+                axes[0,2].set_title("Simulated Raw Input")
+                axes[0,2].axis('off')
+                
+                # Row 2: Intermediate & Output
+                axes[1,0].imshow(tensor_to_image(img_near[idx]))
+                axes[1,0].set_title("Optical Blur (Near Focus)")
+                axes[1,0].axis('off')
+                
+                axes[1,1].imshow(tensor_to_image(img_far[idx]))
+                axes[1,1].set_title("Optical Blur (Far Focus)")
+                axes[1,1].axis('off')
+                
+                axes[1,2].imshow(tensor_to_image(pred_img[idx]))
+                axes[1,2].set_title(f"Reconstructed (Epoch {epoch})")
+                axes[1,2].axis('off')
+                
+                plt.tight_layout()
+                vis_path = os.path.join(output_dir, f'val_epoch_{epoch:03d}.png')
+                plt.savefig(vis_path)
+                
+                if writer:
+                    writer.add_figure('Val/Visualization', fig, epoch)
+                    writer.add_image('Val/GT', rgb_gt[idx], epoch)
+                    writer.add_image('Val/Recon', pred_img[idx], epoch)
+                    writer.add_image('Val/Raw', raw_output[idx], epoch)
+                
+                plt.close()
             
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            
-            # Row 1: Inputs
-            axes[0,0].imshow(tensor_to_image(rgb_gt[idx]))
-            axes[0,0].set_title("GT Sharp Image")
-            axes[0,0].axis('off')
-            
-            depth_vis = depth_map[idx].detach().cpu().squeeze().numpy()
-            im = axes[0,1].imshow(depth_vis, cmap='plasma')
-            axes[0,1].set_title("Depth Map")
-            axes[0,1].axis('off')
-            plt.colorbar(im, ax=axes[0,1], fraction=0.046, pad=0.04)
-            
-            raw_vis = raw_output[idx].detach().cpu().squeeze().numpy()
-            axes[0,2].imshow(raw_vis, cmap='gray')
-            axes[0,2].set_title("Simulated Raw Input")
-            axes[0,2].axis('off')
-            
-            # Row 2: Intermediate & Output
-            axes[1,0].imshow(tensor_to_image(img_near[idx]))
-            axes[1,0].set_title("Optical Blur (Near Focus)")
-            axes[1,0].axis('off')
-            
-            axes[1,1].imshow(tensor_to_image(img_far[idx]))
-            axes[1,1].set_title("Optical Blur (Far Focus)")
-            axes[1,1].axis('off')
-            
-            axes[1,2].imshow(tensor_to_image(pred_img[idx]))
-            axes[1,2].set_title(f"Reconstructed (Epoch {epoch})")
-            axes[1,2].axis('off')
-            
-            plt.tight_layout()
-            vis_path = os.path.join(output_dir, f'val_epoch_{epoch:03d}.png')
-            plt.savefig(vis_path)
-            plt.close()
-            
-        except StopIteration:
-            pass
+    avg_psnr = np.mean(psnr_list) if psnr_list else 0
+    avg_ssim = np.mean(ssim_list) if ssim_list else 0
+    
+    print(f"Validation Epoch {epoch}: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}")
+    
+    if writer:
+        writer.add_scalar('Val/PSNR', avg_psnr, epoch)
+        writer.add_scalar('Val/SSIM', avg_ssim, epoch)
 
 def main():
     # 1. Load Configuration
@@ -128,8 +177,13 @@ def main():
     os.makedirs(exp_dir, exist_ok=True)
     ckpt_dir = os.path.join(exp_dir, 'checkpoints')
     vis_dir = os.path.join(exp_dir, 'visualizations')
+    log_dir = os.path.join(exp_dir, 'logs')
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Initialize TensorBoard Writer
+    writer = SummaryWriter(log_dir=log_dir)
 
     # 2. Initialize Pipeline (Simulation)
     print("Initializing Image Formation Pipeline...")
@@ -227,13 +281,28 @@ def main():
             epoch_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
             
+            # Log batch loss
+            global_step = epoch * len(train_loader) + i
+            writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
+            
         avg_loss = epoch_loss / len(train_loader)
         duration = time.time() - start_time
         print(f"Epoch {epoch+1} completed in {duration:.2f}s. Avg Loss: {avg_loss:.6f}")
         
+        writer.add_scalar('Train/EpochLoss', avg_loss, epoch)
+        
+        # Log Zernike Coefficients
+        z0 = pipeline.optics.zernike_0.detach().cpu().numpy()
+        z90 = pipeline.optics.zernike_90.detach().cpu().numpy()
+        
+        for idx, val in enumerate(z0):
+            writer.add_scalar(f'Optics/Zernike_0_Mode_{idx}', val, epoch)
+        for idx, val in enumerate(z90):
+            writer.add_scalar(f'Optics/Zernike_90_Mode_{idx}', val, epoch)
+
         # Validation & Saving
         if (epoch + 1) % 1 == 0: # Visualize every epoch
-            validate_and_visualize(pipeline, model, val_loader, device, epoch+1, vis_dir)
+            validate_and_visualize(pipeline, model, val_loader, device, epoch+1, vis_dir, writer)
             
         if (epoch + 1) % 5 == 0: # Save checkpoint every 5 epochs
             save_path = os.path.join(ckpt_dir, f'checkpoint_epoch_{epoch+1}.pth')
@@ -241,6 +310,7 @@ def main():
             print(f"Checkpoint saved to {save_path}")
 
     print("Training finished.")
+    writer.close()
 
 if __name__ == "__main__":
     main()

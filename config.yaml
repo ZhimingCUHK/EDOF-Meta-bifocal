@@ -7,8 +7,8 @@ optics:
   pupil_grid_size: 256
 
 sensor:
-  height: 512
-  width: 512
+  height: 256
+  width: 256
   noise_sigma: 0.01
 
 layers:
