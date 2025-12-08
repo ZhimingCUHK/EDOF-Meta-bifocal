@@ -4,7 +4,7 @@
 
 This repository implements a differentiable end-to-end imaging pipeline that jointly optimizes optical parameters (Zernike coefficients) and a deep learning reconstruction network (MIMO-UNet) to achieve Extended Depth of Field (EDOF).
 
-## 🚀 Key Features
+##  Key Features
 
 *   **Differentiable Optics Simulation**: Simulates Point Spread Functions (PSF) based on Zernike polynomials and depth information.
 *   **Bifocal Polarization Design**: Models a system with two distinct focal planes (Near/Far) controlled by polarization states (0° and 90°).
@@ -12,7 +12,7 @@ This repository implements a differentiable end-to-end imaging pipeline that joi
 *   **Physics-based Sensor Simulation**: Includes realistic sensor modeling with Bayer/Polarization mosaic patterns and noise injection.
 *   **MIMO-UNet Architecture**: Utilizes a Multi-Input Multi-Output U-Net for robust multi-scale image restoration.
 
-## 📂 Project Structure
+##  Project Structure
 
 ```
 EDOF-Meta-bifocal/
@@ -31,7 +31,7 @@ EDOF-Meta-bifocal/
 │       └── dataloader.py   # SceneFlow dataset loader
 ```
 
-## 🛠️ Installation
+##  Installation
 
 1.  Clone the repository:
     ```bash
@@ -44,7 +44,7 @@ EDOF-Meta-bifocal/
     pip install torch torchvision numpy matplotlib pyyaml poppy astropy opencv-python tqdm
     ```
 
-## 🏃‍♂️ Usage
+##  Usage
 
 ### 1. Configuration
 Modify `config.yaml` to set up your optical parameters, sensor specs, and training hyperparameters.
@@ -66,7 +66,7 @@ The script will:
 4.  Compute Multi-Scale Loss against the Ground Truth.
 5.  Backpropagate gradients to update both the Network weights and Optical parameters.
 
-## 📊 Visualization
+##  Visualization
 Training progress and validation results (GT vs. Simulated Input vs. Reconstructed Output) are saved in `experiments/train_run/visualizations`.
 
 ---
