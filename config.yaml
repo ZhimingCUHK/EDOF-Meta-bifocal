@@ -19,4 +19,5 @@ layers:
 training:
   batch_size: 4
   learning_rate: 0.001
+  optics_learning_rate: 0.00001
   epochs: 100

@@ -180,9 +180,12 @@ def main():
     
     # Joint optimization: Network + Optics
     # Usually optics parameters need a smaller learning rate
+    optics_lr = config['training'].get('optics_learning_rate', 1e-5)
+    print(f"Optimizer setup: Network LR = {config['training']['learning_rate']}, Optics LR = {optics_lr}")
+
     optimizer = optim.Adam([
         {'params': model.parameters(), 'lr': config['training']['learning_rate']},
-        {'params': pipeline.parameters(), 'lr': 1e-5} 
+        {'params': pipeline.parameters(), 'lr': optics_lr} 
     ])
     
     num_epochs = config['training']['epochs']
