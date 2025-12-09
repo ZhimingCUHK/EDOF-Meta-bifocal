@@ -105,8 +105,10 @@ def render_blurred_image_v2(sharp_img, layer_masks, psf_bank):
         # --- Key step: Energy normalization ---
         # Corresponds to image_process.py: blurred_volume / (blurred_cumsum_alpha + eps)
         # This step corrects brightness dimming caused by PSF diffusion
-        b_vol_norm = b_vol / (b_cumsum + eps)
-        b_alpha_norm = b_alpha / (b_cumsum + eps)
+        # Increased eps to 1e-3 to prevent gradient explosion when b_cumsum is small
+        safe_eps = 1e-3
+        b_vol_norm = b_vol / (b_cumsum + safe_eps)
+        b_alpha_norm = b_alpha / (b_cumsum + safe_eps)
 
         # Clamp range
         b_alpha_norm = torch.clamp(b_alpha_norm, 0.0, 1.0)
