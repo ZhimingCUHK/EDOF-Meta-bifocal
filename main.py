@@ -20,7 +20,7 @@ except ImportError:
 
 from src.models.pipeline import ImageFormationPipeline
 from src.data.dataloader import SceneFlowDataset
-# 确保你的 mimo_unet.py 里已经注册了 'PolarMIMOUNet'
+# Ensure that 'PolarMIMOUNet' is registered in your mimo_unet.py
 from src.network.polar_mimo_unet import build_net 
 
 def load_config(config_path):
@@ -55,7 +55,7 @@ def calculate_metrics(img1, img2):
         
     return psnr, ssim
 
-# ================= 修改点 1: MultiScaleLoss 适配 H/2 输出 =================
+# ================= Modification 1: MultiScaleLoss adapted for H/2 output =================
 class MultiScaleLoss(nn.Module):
     def __init__(self):
         super(MultiScaleLoss, self).__init__()
@@ -69,15 +69,15 @@ class MultiScaleLoss(nn.Module):
                  outputs[2]: Large (H/2) <- Main Output
         label: GT image [B, 3, H, W] (Full Resolution)
         """
-        # 1. 将 GT 下采样到 H/2，作为主输出的 Target
+        # 1. Downsample GT to H/2 as the target for main output
         label_half = F.interpolate(label, scale_factor=0.5, mode='bilinear', align_corners=False)
         
-        # 2. 将 GT 继续下采样到 H/4 和 H/8
+        # 2. Further downsample GT to H/4 and H/8
         label_quarter = F.interpolate(label_half, scale_factor=0.5, mode='bilinear', align_corners=False)
         label_eighth = F.interpolate(label_quarter, scale_factor=0.5, mode='bilinear', align_corners=False)
         
-        # 3. 计算 Loss (注意 outputs 的顺序与 Label 的对应关系)
-        # 假设 outputs 顺序是 [Small, Mid, Large]
+        # 3. Calculate Loss (note the correspondence between outputs order and labels)
+        # Assuming outputs order is [Small, Mid, Large]
         loss_small = self.criterion(outputs[0], label_eighth)
         loss_mid   = self.criterion(outputs[1], label_quarter)
         loss_large = self.criterion(outputs[2], label_half)
@@ -92,7 +92,7 @@ def save_checkpoint(model, optimizer, epoch, save_path):
         'optimizer_state_dict': optimizer.state_dict(),
     }, save_path)
 
-# ================= 修改点 2: 验证时对齐尺寸 =================
+# ================= Modification 2: Align dimensions during validation =================
 def validate_and_visualize(pipeline, model, val_loader, device, epoch, output_dir, writer=None):
     model.eval()
     pipeline.eval()
@@ -117,7 +117,7 @@ def validate_and_visualize(pipeline, model, val_loader, device, epoch, output_di
 
             # Calculate metrics
             for b in range(rgb_gt.shape[0]):
-                # 使用缩小后的 GT 计算
+                # Use downsampled GT for calculation
                 p, s = calculate_metrics(gt_half[b], pred_img[b])
                 psnr_list.append(p)
                 ssim_list.append(s)
@@ -208,10 +208,10 @@ def main():
     for param in pipeline.parameters():
         param.requires_grad = True
 
-    # ================= 修改点 3: 初始化 PolarMIMOUNet =================
+    # ================= Modification 3: Initialize PolarMIMOUNet =================
     print("Initializing PolarMIMOUNet...")
-    # 使用修改后的类名（在 build_net 中注册的名字）
-    # in_channel=1 因为输入是单通道 RAW
+    # Use the modified class name (registered in build_net)
+    # in_channel=1 because input is single-channel RAW
     try:
         model = build_net('PolarMIMOUNet', in_channel=1).to(device)
     except:
@@ -277,7 +277,7 @@ def main():
             raw_output, _, _ = pipeline(rgb_gt, depth_map)
             preds = model(raw_output) 
             
-            # Loss Function 会自动处理分辨率匹配
+            # Loss Function will automatically handle resolution matching
             loss = criterion(preds, rgb_gt)
             
             if torch.isnan(loss) or torch.isinf(loss):

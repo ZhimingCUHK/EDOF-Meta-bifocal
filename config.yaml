@@ -9,7 +9,7 @@ optics:
 sensor:
   height: 256
   width: 256
-  noise_sigma: 0.01
+  noise_sigma: 0.01    # needs calibration 
 
 layers:
   num_layers: 12

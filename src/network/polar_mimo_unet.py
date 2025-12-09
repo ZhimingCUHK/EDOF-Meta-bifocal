@@ -31,7 +31,7 @@ class AFF(nn.Module):
         )
 
     def forward(self, x1, x2, x4):
-        # 这里的 interpolate 是处理 Feature Map 的，必须保留
+        # The interpolate here is for processing Feature Maps and must be preserved
         x = torch.cat([x1, x2, x4], dim=1)
         return self.conv(x)
 
@@ -66,7 +66,7 @@ class FAM(nn.Module):
 
 class PolarMIMOUNet(nn.Module):
     """
-    专门适配偏振/Bayer RAW 输入的 MIMO-UNet
+    MIMO-UNet specifically adapted for polarized/Bayer RAW input
     Input: [B, 1, H, W] RAW Data
     Output: [B, 3, H/2, W/2] RGB Data (Scale 1, 2, 3)
     """
@@ -75,7 +75,7 @@ class PolarMIMOUNet(nn.Module):
 
         base_channel = 32
         
-        # 定义多尺度 RAW 输入的通道数 (通过 PixelUnshuffle 计算)
+        # Define multi-scale RAW input channels (calculated via PixelUnshuffle)
         # Input (Raw): 1 ch
         # Scale 1 (Input to Encoder): Unshuffle(2) -> 1 * 2*2 = 4 ch
         # Scale 2: Unshuffle(Scale1, 2) -> 4 * 2*2 = 16 ch
@@ -89,13 +89,13 @@ class PolarMIMOUNet(nn.Module):
         ])
 
         self.feat_extract = nn.ModuleList([
-            # 修改 1: 输入层接受 4 通道 (Packed RAW)
+            # Modification 1: Input layer accepts 4 channels (Packed RAW)
             BasicConv(c1, base_channel, kernel_size=3, relu=True, stride=1),
             BasicConv(base_channel, base_channel*2, kernel_size=3, relu=True, stride=2),
             BasicConv(base_channel*2, base_channel*4, kernel_size=3, relu=True, stride=2),
             BasicConv(base_channel*4, base_channel*2, kernel_size=4, relu=True, stride=2, transpose=True),
             BasicConv(base_channel*2, base_channel, kernel_size=4, relu=True, stride=2, transpose=True),
-            # 修改 2: 输出层输出 3 通道 (RGB)
+            # Modification 2: Output layer outputs 3 channels (RGB)
             BasicConv(base_channel, 3, kernel_size=3, relu=False, stride=1)
         ])
 
@@ -123,16 +123,16 @@ class PolarMIMOUNet(nn.Module):
         ])
 
         self.FAM1 = FAM(base_channel * 4)
-        # 修改 3: SCM1 接受最深层 Scale 3 的输入 (64通道)
+        # Modification 3: SCM1 accepts deepest Scale 3 input (64 channels)
         self.SCM1 = SCM(base_channel * 4, in_channel=c3)
         
         self.FAM2 = FAM(base_channel * 2)
-        # 修改 4: SCM2 接受中间层 Scale 2 的输入 (16通道)
+        # Modification 4: SCM2 accepts middle Scale 2 input (16 channels)
         self.SCM2 = SCM(base_channel * 2, in_channel=c2)
 
     def pixel_unshuffle(self, x, downscale_factor):
         """
-        Space-to-Depth 转换，用于处理 RAW 数据
+        Space-to-Depth conversion for processing RAW data
         """
         b, c, h, w = x.shape
         out_channel = c * (downscale_factor ** 2)
@@ -146,8 +146,8 @@ class PolarMIMOUNet(nn.Module):
     def forward(self, x):
         # x: [Batch, 1, H, W] RAW Input
         
-        # === 核心修改：生成多尺度输入 ===
-        # 使用 Unshuffle 替代 Interpolate，保护 Bayer/Polar 结构
+        # === Core modification: Generate multi-scale inputs ===
+        # Use Unshuffle instead of Interpolate to protect Bayer/Polar structure
         
         # Scale 1 (Network Input): [B, 4, H/2, W/2]
         x_1 = self.pixel_unshuffle(x, 2) 
@@ -158,7 +158,7 @@ class PolarMIMOUNet(nn.Module):
         # Scale 3 (Small): [B, 64, H/8, W/8]
         x_4 = self.pixel_unshuffle(x_2, 2)
 
-        # SCM 提取特征
+        # SCM feature extraction
         z2 = self.SCM2(x_2)
         z4 = self.SCM1(x_4)
 
@@ -176,7 +176,7 @@ class PolarMIMOUNet(nn.Module):
         z = self.FAM1(z, z4)
         z = self.Encoder[2](z)
 
-        # AFF 特征融合 (这里可以使用 interpolate，因为已经是 Feature 域了)
+        # AFF feature fusion (interpolate can be used here since we're in feature domain)
         z12 = F.interpolate(res1, scale_factor=0.5)
         z21 = F.interpolate(res2, scale_factor=2)
         z42 = F.interpolate(z, scale_factor=2)
@@ -190,7 +190,7 @@ class PolarMIMOUNet(nn.Module):
         z = self.Decoder[0](z)
         z_ = self.ConvsOut[0](z)
         z = self.feat_extract[3](z)
-        # 修改 5: 移除 + x_4 (Raw无法加RGB)
+        # Modification 5: Remove + x_4 (Raw cannot be added to RGB)
         outputs.append(z_) 
 
         # Scale 2 Output
@@ -208,9 +208,9 @@ class PolarMIMOUNet(nn.Module):
         z = self.feat_extract[5](z)
         outputs.append(z)
 
-        # outputs[0]: H/8 尺寸 RGB
-        # outputs[1]: H/4 尺寸 RGB
-        # outputs[2]: H/2 尺寸 RGB (最终结果)
+        # outputs[0]: H/8 resolution RGB
+        # outputs[1]: H/4 resolution RGB
+        # outputs[2]: H/2 resolution RGB (final result)
         return outputs
 
 def build_net(model_name, in_channel=1):
@@ -225,7 +225,7 @@ def build_net(model_name, in_channel=1):
         raise ModelError('MIMO-UNetPlus implementation for Polar Raw is not ready yet. Use PolarMIMOUNet.')
     elif model_name == "MIMO-UNet":
         return PolarMIMOUNet(in_channel=in_channel)
-    elif model_name == "PolarMIMOUNet": # 显式调用
+    elif model_name == "PolarMIMOUNet": # Explicit call
         return PolarMIMOUNet(in_channel=in_channel)
         
     raise ModelError('Wrong Model!\nYou should choose MIMO-UNet (Polar version).')
