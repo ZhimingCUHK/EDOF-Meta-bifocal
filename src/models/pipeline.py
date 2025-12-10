@@ -9,123 +9,90 @@ class ImageFormationPipeline(nn.Module):
                  optics_config=None, 
                  sensor_config=None, 
                  layer_config=None):
-        """
-        End-to-end Image Formation Pipeline for EDOF-Meta-Bifocal system.
-        
-        Args:
-            optics_config (dict): Parameters for DifferentiableOptics
-            sensor_config (dict): Parameters for IMX250MYR_SENSOR
-            layer_config (dict): Parameters for depth layering (num_layers, min_dist, max_dist)
-        """
         super().__init__()
         
-        # Default configurations
-        if optics_config is None:
-            optics_config = {}
-        if sensor_config is None:
-            sensor_config = {'height': 512, 'width': 512}
-        if layer_config is None:
-            layer_config = {'num_layers': 12, 'min_dist': 0.2, 'max_dist': 20.0}
-
-        # 1. Initialize Optics Layer
-        self.optics = DifferentiableOptics(**optics_config)
+        if optics_config is None: optics_config = {}
+        if sensor_config is None: sensor_config = {'height': 512, 'width': 512}
         
-        # 2. Initialize Sensor Layer
+        # === 修改点 1: 更新默认深度范围 ===
+        # 配合 Dataloader: 0.5m 起始，25.0m 结束 (之后归为背景层)
+        if layer_config is None:
+            layer_config = {'num_layers': 12, 'min_dist': 0.5, 'max_dist': 25.0}
+
+        self.optics = DifferentiableOptics(**optics_config)
         self.sensor = IMX250MYR_SENSOR(**sensor_config)
         
-        # 3. Layer Settings
         self.num_layers = layer_config.get('num_layers', 12)
-        self.min_dist = layer_config.get('min_dist', 0.2)
-        self.max_dist = layer_config.get('max_dist', 20.0)
+        self.min_dist = layer_config.get('min_dist', 0.5)
+        self.max_dist = layer_config.get('max_dist', 25.0)
         
-        # 4. Auto-calculate Bifocal Focus Distances
-        # Strategy: 
-        #   - 0 deg polarization -> Near Focus (Layer 1, 2nd nearest)
-        #   - 90 deg polarization -> Far Focus (Layer N-2, 2nd farthest)
-        self.d_focus_0, self.d_focus_90 = self._calculate_bifocal_distances()
+        # === 修改点 2: 手动指定 SceneFlow 的最佳双焦 ===
+        self.d_near, self.d_far = self._calculate_bifocal_distances()
+        
+        # === FIX: 绑定变量名，确保 generate_psf_banks 能正确调用 ===
+        self.d_focus_0 = self.d_near   # Channel 0 (Near)
+        self.d_focus_90 = self.d_far   # Channel 90 (Far)
         
         print(f"[Pipeline] Initialized.")
-        print(f"  - Focus 0 deg (Near): {self.d_focus_0:.4f} m")
-        print(f"  - Focus 90 deg (Far): {self.d_focus_90:.4f} m")
+        print(f"  - EDOF Range: {self.min_dist}m to {self.max_dist}m (+Infinity)")
+        print(f"  - Focus 0 deg (Near): {self.d_focus_0:.2f} m")
+        print(f"  - Focus 90 deg (Far): {self.d_focus_90:.2f} m")
 
     def _calculate_bifocal_distances(self):
         """
-        Auto-calculate focus distances aligned with layer centers.
+        Manual override for SceneFlow dataset.
         """
-        min_diopter = 1.0 / self.max_dist
-        max_diopter = 1.0 / self.min_dist
-        
-        # Near Focus: Layer 1 (2nd nearest)
-        # Original index logic: k_orig = num_layers - 1 - k_output
-        # We want output index k=1 -> k_orig = num_layers - 2
-        k_near = self.num_layers - 2
-        norm_val_near = (k_near + 0.5) / self.num_layers
-        diopter_near = min_diopter + norm_val_near * (max_diopter - min_diopter)
-        d_near = 1.0 / diopter_near
-        
-        # Far Focus: Layer N-2 (2nd farthest)
-        # We want output index k=num_layers-2 -> k_orig = 1
-        k_far = 1
-        norm_val_far = (k_far + 0.5) / self.num_layers
-        diopter_far = min_diopter + norm_val_far * (max_diopter - min_diopter)
-        d_far = 1.0 / diopter_far
-        
+        # 近焦 0.8m
+        d_near = 0.8
+        # 远焦 6.0m
+        d_far = 20.0
         return d_near, d_far
 
     def generate_psf_banks(self):
         """
-        Generate PSF banks for all layers for both polarizations.
-        Returns:
-            psf_bank_0: [K, 3, H_psf, W_psf]
-            psf_bank_90: [K, 3, H_psf, W_psf]
+        Generate PSFs for K layers.
+        Order must match get_layer_masks: Index 0 (Near) -> Index K-1 (Far)
         """
         psf_list_0 = []
         psf_list_90 = []
         
-        min_diopter = 1.0 / self.max_dist
-        max_diopter = 1.0 / self.min_dist
+        max_diopter = 1.0 / self.min_dist # Near
+        min_diopter = 1.0 / self.max_dist # Far
         
-        # Iterate through layers to generate PSFs
-        # Note: The loop order must match get_layer_masks output (Nearest -> Farthest)
         for k in range(self.num_layers):
-            # Calculate object distance for current layer center
-            # get_layer_masks returns [Foreground(Near) -> Background(Far)]
-            # So k=0 is Nearest.
-            # In diopter space (linear), High Diopter is Near.
-            # We map k=0 -> High Diopter (Index N-1 in linear space)
-            k_orig = self.num_layers - 1 - k
-            
-            norm_val = (k_orig + 0.5) / self.num_layers
-            diopter = min_diopter + norm_val * (max_diopter - min_diopter)
+            # Calculate center diopter for layer k
+            # k=0 -> Near, k=K-1 -> Far
+            norm_val = k / (self.num_layers - 1)
+            diopter = max_diopter - norm_val * (max_diopter - min_diopter)
             d_obj = 1.0 / diopter
             
-            # Generate PSF pair for this depth
-            # d_obj is scalar here, but optics expects tensor or float
-            # We pass float, optics handles it.
             psf_0, psf_90 = self.optics(d_obj, self.d_focus_0, self.d_focus_90)
-            
             psf_list_0.append(psf_0)
             psf_list_90.append(psf_90)
             
-        psf_bank_0 = torch.stack(psf_list_0)   # [K, 3, H, W]
-        psf_bank_90 = torch.stack(psf_list_90) # [K, 3, H, W]
+        psf_bank_0 = torch.stack(psf_list_0)
+        psf_bank_90 = torch.stack(psf_list_90)
         
         return psf_bank_0, psf_bank_90
 
     def forward(self, sharp_img, depth_map):
-        """
-        Args:
-            sharp_img: [B, 3, H, W] RGB image (0-1)
-            depth_map: [B, 1, H, W] Depth map in meters
-        Returns:
-            raw_sensor_output: [B, 1, H, W] Mosaic RAW image
-            img_blurred_0: [B, 3, H, W] Simulated 0-deg image
-            img_blurred_90: [B, 3, H, W] Simulated 90-deg image
-        """
-        # 1. Generate PSF Banks (Differentiable)
         psf_bank_0, psf_bank_90 = self.generate_psf_banks()
+
+        if not hasattr(self,'has_saved_debug'):
+            import torchvision
+            import os
+            os.makedirs('debug_psfs',exist_ok=True)
+            
+            torchvision.utils.save_image(psf_bank_0[0], 'debug_psfs/ch0_layer0_near.png', normalize=True)
+            torchvision.utils.save_image(psf_bank_0[-1], 'debug_psfs/ch0_layer11_far.png', normalize=True)
+
+            torchvision.utils.save_image(psf_bank_90[0], 'debug_psfs/ch90_layer0_near.png', normalize=True)
+            torchvision.utils.save_image(psf_bank_90[-1], 'debug_psfs/ch90_layer11_far.png', normalize=True)
+
+            print("[Pipeline] Saved debug PSF images.")
+            self.has_saved_debug = True
         
-        # 2. Calculate Layer Masks
+        # depth_map 可能包含 900m 的值，get_layer_masks 会处理它
         layer_masks = get_layer_masks(
             depth_map, 
             num_layers=self.num_layers, 
@@ -133,11 +100,9 @@ class ImageFormationPipeline(nn.Module):
             max_dist=self.max_dist
         )
         
-        # 3. Render Blurred Images (Layered Rendering)
         img_blurred_0 = render_blurred_image_v2(sharp_img, layer_masks, psf_bank_0)
         img_blurred_90 = render_blurred_image_v2(sharp_img, layer_masks, psf_bank_90)
         
-        # 4. Simulate Sensor (Polarization + Mosaic + Noise)
         raw_output = self.sensor(img_blurred_0, img_blurred_90)
         
         return raw_output, img_blurred_0, img_blurred_90

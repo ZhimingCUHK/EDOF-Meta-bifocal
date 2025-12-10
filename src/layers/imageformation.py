@@ -1,148 +1,148 @@
 import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
-from torch.nn import functional as F
-
+import torch.nn.functional as F
+import torch.fft
 
 def get_layer_masks(depth_map_meters,
                     num_layers=12,
-                    min_dist=0.2,
-                    max_dist=20.0):
+                    min_dist=0.5,
+                    max_dist=25.0):
     """
-    Convert physical depth map to K layer Masks (based on uniform diopter slicing)
-    depth_map_meters: [B, 1, H, W]
-    Returns: layers_alpha [B, K, 1, H, W]
+    Robust Layering using Nearest Neighbor (Argmin).
+    Handles background (depth > max_dist) correctly by assigning it to the last layer.
+    
+    Order: Index 0 = Nearest (Foreground), Index K-1 = Farthest (Background)
     """
     device = depth_map_meters.device
+    
+    # 1. 转换到屈光度空间 (Diopter = 1/d)
+    # 物理规律：距离越近，屈光度越大；距离越远，屈光度越小。
+    input_diopter = 1.0 / (depth_map_meters + 1e-8)
+    
+    max_diopter = 1.0 / min_dist  # 对应近处边界 (e.g. 2.0 D)
+    min_diopter = 1.0 / max_dist  # 对应远处边界 (e.g. 0.04 D)
 
-    # 1. Convert to diopter (1/d)
-    diopter_map = 1.0 / (depth_map_meters + 1e-8)
-    max_diopter = 1.0 / min_dist  # 5.0
-    min_diopter = 1.0 / max_dist  # 0.05
+    # 2. 生成 K 个层的中心屈光度 (Layer Centers)
+    # 线性插值生成每个层的中心屈光度值
+    # k=0 -> Near (Max Diopter), k=K-1 -> Far (Min Diopter)
+    layer_indices = torch.arange(num_layers, device=device).float()
+    
+    # Formula: D_k = D_max - (k / (K-1)) * (D_max - D_min)
+    layer_centers = max_diopter - (layer_indices / (num_layers - 1)) * (max_diopter - min_diopter)
+    
+    # Reshape for broadcasting: [1, K, 1, 1, 1] vs [B, 1, 1, H, W]
+    layer_centers = layer_centers.view(1, num_layers, 1, 1, 1)
+    input_diopter_expanded = input_diopter.unsqueeze(1) # [B, 1, 1, H, W]
 
-    # 2. Normalize diopter to [0, K]
-    # 0 represents farthest (20m), K represents nearest (0.2m)
-    norm_diopter = (diopter_map - min_diopter) / (max_diopter - min_diopter)
-    norm_diopter = torch.clamp(norm_diopter, 0.0, 1.0 - 1e-6)
-    scaled_diopter = norm_diopter * num_layers
+    # 3. Hard Assignment via Argmin (Nearest Neighbor)
+    # 计算输入像素与所有层中心的距离，找到最近的层
+    # 这能自动处理超远距离 (e.g. 900m -> D~0 -> Closest to D_min -> Index K-1)
+    dist_to_layers = torch.abs(input_diopter_expanded - layer_centers)
+    mask_indices = torch.argmin(dist_to_layers, dim=1, keepdim=True) # [B, 1, 1, H, W]
 
-    # 3. Generate Mask for each layer
-    # layer_indices: [1, K, 1, 1, 1]
-    layer_indices = torch.arange(num_layers,
-                                 device=device).view(1, num_layers, 1, 1, 1)
+    # 4. 生成 One-hot Mask
+    masks = torch.zeros_like(dist_to_layers)
+    masks.scatter_(1, mask_indices, 1.0)
+    
+    return masks
 
-    # Compare: which layer the pixel belongs to
-    # diff: [B, K, 1, H, W]
-    diff = scaled_diopter.unsqueeze(1) - layer_indices
+def fft_conv2d(img, psf):
+    """
+    使用 FFT 实现卷积，大幅加速大核计算。
+    Args:
+        img: [B, C, H, W]
+        psf: [C, H_k, W_k] 
+    Returns:
+        res: [B, C, H, W]
+    """
+    B, C, H, W = img.shape
+    device = img.device
+    
+    # PSF 尺寸
+    kh, kw = psf.shape[-2:]
+    
+    # 1. 预处理 PSF (维度对齐)
+    # psf: [C, H_k, W_k] -> [1, C, H_k, W_k]
+    if psf.dim() == 3:
+        psf = psf.unsqueeze(0)
+    
+    # 2. 计算 Padding 后的 FFT 尺寸
+    # 为了避免循环卷积带来的边缘伪影，理论上应该 Pad 到 H+kh-1。
+    # 但在 Deep Optics 训练中，为了速度和显存，通常直接 Pad 到 H, W (Circular Convolution)。
+    # 只要边缘不是核心区域，这带来的误差可以忽略。
+    fft_h, fft_w = H, W
 
-    # Hard Mask: Select interval [0, 1)
-    mask = (diff >= 0) & (diff < 1)
-
-    # Flip order! Ensure k=0 is nearest (foreground), k=N is farthest (background), or vice versa
-    # The logic here is 0 corresponds to farthest.
-    # To match "near occludes far" compositing logic, usually expect index 0 to be foreground.
-    # So we flip it:
-    return torch.flip(mask.float(), dims=[1])
+    # 3. 频域转换 (RFFT 利用实数对称性加速)
+    # s=(H, W) 会自动对输入进行 Padding (右侧补0)
+    img_freq = torch.fft.rfft2(img, s=(fft_h, fft_w)) # [B, C, H, W/2+1]
+    psf_freq = torch.fft.rfft2(psf, s=(fft_h, fft_w)) # [1, C, H, W/2+1]
+    
+    # 4. 频域卷积 (点乘)
+    res_freq = img_freq * psf_freq
+    
+    # 5. 逆变换回空域
+    res = torch.fft.irfft2(res_freq, s=(fft_h, fft_w))
+    
+    # 6. 相位校正 (Circular Shift)
+    # 因为 rfft2 默认是以左上角 (0,0) 为原点进行 Padding 的。
+    # 而我们的 PSF 能量中心在 (kh/2, kw/2)。
+    # 直接卷积会导致结果向右下偏移 (kh/2, kw/2)。
+    # 我们需要把结果 Roll 回来，让中心对齐。
+    roll_h = -kh // 2
+    roll_w = -kw // 2
+    res = torch.roll(res, shifts=(roll_h, roll_w), dims=(-2, -1))
+    
+    # 确保尺寸严格匹配 (以防 fft size 变化)
+    res = res[..., :H, :W]
+    
+    return res
 
 def render_blurred_image_v2(sharp_img, layer_masks, psf_bank):
     """
-    Rewritten rendering function based on image_process.py logic.
-    Uses normalization and Over Operator to handle occlusion, solving background black edge problem.
+    基于 FFT 卷积的分层渲染函数 (Standard Front-to-Back Compositing)。
+    修复了之前版本中多重 Alpha 乘法和归一化错误的问题。
     
     Args:
-        sharp_img: [B, 3, H, W]
-        layer_masks: [B, K, 1, H, W] (assumed order: 0=foreground/nearest, K-1=background/farthest)
-        psf_bank: [K, 3, H, W]
+        sharp_img: [B, 3, H, W] - 原始清晰图像
+        layer_masks: [B, K, 1, H, W] - 每一层的 Mask (One-hot)
+        psf_bank: [K, 3, Hk, Wk] - 每一层的 PSF
+        
+    Returns:
+        final_image: [B, 3, H, W] - 渲染后的模糊图像
     """
     B, K, _, H, W = layer_masks.shape
-    device = sharp_img.device
-    eps = 1e-6  # Small value to prevent division by zero
-
-    # --- 1. Prepare cumulative Alpha for normalization (Cumsum Alpha) ---
-    # Logic: Calculate the sum of current layer and all layers behind it.
-    # In image_process.py: reverse -> cumsum -> reverse.
-    # Here masks are already [near -> far], so we need to flip to [far -> near] first for cumsum
-    masks_flipped = torch.flip(layer_masks, dims=[1])
-    cumsum_flipped = torch.cumsum(masks_flipped, dim=1)
-    cumsum_alpha = torch.flip(cumsum_flipped, dims=[1])  # [B, K, 1, H, W]
-
-    # Collect results for each layer after processing
-    norm_vol_list = []
-    norm_alpha_list = []
-
-    # --- 2. Layer-by-layer blurring and normalization ---
+    
+    # 初始化累积图像和透射率
+    # output_image: 最终图像
+    # transmittance: 剩余光线透过率 (初始为 1.0，即全透)
+    output_image = torch.zeros_like(sharp_img)
+    transmittance = torch.ones((B, 1, H, W), device=sharp_img.device)
+    
+    # 循环：从近 (k=0) 到远 (k=K-1)
     for k in range(K):
-        # Get current layer data
-        mask = layer_masks[:, k]          # [B, 1, H, W]
-        mask_cum = cumsum_alpha[:, k]     # [B, 1, H, W] (source for normalization denominator)
-        psf = psf_bank[k]                 # [3, H, W]
+        # 1. 获取当前层数据
+        mask = layer_masks[:, k]      # [B, 1, H, W]
+        psf = psf_bank[k]             # [3, Hk, Wk]
 
-        # Premultiply Alpha: Extract current layer color
-        # Corresponds to volume = layered_depth * img in image_process.py
-        volume = sharp_img * mask
+        # 2. 准备卷积输入 (Premultiplied Color)
+        # 这一层原本的颜色贡献 = 图像 * Mask
+        layer_color = sharp_img * mask 
+        
+        # 3. FFT 卷积
+        # 模糊后的颜色 (Blurred Premultiplied Color)
+        # 模糊后的 Alpha (Blurred Alpha)
+        b_color = fft_conv2d(layer_color, psf)
+        b_alpha = fft_conv2d(mask.repeat(1, 3, 1, 1), psf)
+        
+        # 限制 Alpha 范围，防止数值误差导致 > 1
+        b_alpha = torch.clamp(b_alpha, 0.0, 1.0)
 
-        # Prepare convolution weights
-        pad_h, pad_w = psf.shape[1] // 2, psf.shape[2] // 2
-        psf_weight = psf.unsqueeze(1)  # [3, 1, H, W]
-
-        # Execute blurring (convolution)
-        # Corresponds to img_psf_conv in image_process.py
-        # 1. Blur color volume
-        b_vol = F.conv2d(volume, psf_weight, padding=(pad_h, pad_w), groups=3)
-        # 2. Blur current layer Alpha
-        mask_expanded = mask.repeat(1, 3, 1, 1)
-        b_alpha = F.conv2d(mask_expanded, psf_weight, padding=(pad_h, pad_w), groups=3)
-        # 3. Blur cumulative Alpha (for normalization)
-        mask_cum_expanded = mask_cum.repeat(1, 3, 1, 1)
-        b_cumsum = F.conv2d(mask_cum_expanded, psf_weight, padding=(pad_h, pad_w), groups=3)
-
-        # Crop size (in case padding causes size change)
-        if b_vol.shape[-2:] != (H, W):
-            b_vol = b_vol[..., :H, :W]
-            b_alpha = b_alpha[..., :H, :W]
-            b_cumsum = b_cumsum[..., :H, :W]
-
-        # --- Key step: Energy normalization ---
-        # Corresponds to image_process.py: blurred_volume / (blurred_cumsum_alpha + eps)
-        # This step corrects brightness dimming caused by PSF diffusion
-        # Increased eps to 1e-3 to prevent gradient explosion when b_cumsum is small
-        safe_eps = 1e-3
-        b_vol_norm = b_vol / (b_cumsum + safe_eps)
-        b_alpha_norm = b_alpha / (b_cumsum + safe_eps)
-
-        # Clamp range
-        b_alpha_norm = torch.clamp(b_alpha_norm, 0.0, 1.0)
-
-        norm_vol_list.append(b_vol_norm)
-        norm_alpha_list.append(b_alpha_norm)
-
-    # Stack results [B, K, 3, H, W]
-    stack_vol = torch.stack(norm_vol_list, dim=1)
-    stack_alpha = torch.stack(norm_alpha_list, dim=1)
-
-    # --- 3. Compositing (Over Operator) ---
-    # Corresponds to over_op and reduce_sum in image_process.py
-
-    # Calculate transmittance: Proportion of light remaining after passing through all previous layers
-    # Formula: T_i = (1-a_0) * (1-a_1) * ... * (1-a_{i-1})
-    # Use cumprod (cumulative product)
-    one_minus_alpha = 1.0 - stack_alpha
-    transmittance = torch.cumprod(one_minus_alpha, dim=1)
-
-    # Construct weights: Layer 0 weight is 1, layer k weight is transmittance[k-1]
-    ones = torch.ones_like(stack_alpha[:, :1])
-    weights = torch.cat([ones, transmittance[:, :-1]], dim=1)  # [B, K, 3, H, W]
-
-    # Weighted sum to get final image
-    # Captimg = Sum( Weight_k * Layer_Color_k )
-    final_image = torch.sum(weights * stack_vol * stack_alpha, dim=1)
-    # Note: If stack_vol is already premultiplied by alpha (in b_vol step), may not need to multiply stack_alpha again.
-    # But according to image_process.py logic, it uses over_alpha * blurred_volume in final reduce_sum.
-    # And its blurred_volume is normalized color.
-    # Here stack_vol is (Color * Mask)_blurred / Cumsum_blurred.
-    # Usually recommended final output: torch.sum(weights * stack_vol, dim=1)
-    # Because stack_vol already implicitly contains the visibility distribution of that layer.
-
-    final_image = torch.sum(weights * stack_vol, dim=1)
-
-    return final_image
+        # 4. Front-to-Back 合成
+        # 当前层贡献 = 模糊颜色 * 当前剩余透射率
+        output_image = output_image + b_color * transmittance
+        
+        # 更新透射率
+        # 光线穿过当前层后，被遮挡了 b_alpha 部分
+        # T_new = T_old * (1 - alpha)
+        transmittance = transmittance * (1.0 - b_alpha)
+        
+    return output_image
