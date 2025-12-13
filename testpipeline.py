@@ -4,42 +4,42 @@ import numpy as np
 import os
 import cv2
 
-# 引入你的 Pipeline
+# Import your Pipeline
 from src.models.pipeline import ImageFormationPipeline
 
 def create_synthetic_scene(H=512, W=512):
     """
-    创建一个专门用于测试 EDOF 的合成场景。
-    - RGB: 高频网格图 (Grid)，用于观察模糊。
-    - Depth: 中间是近景 (0.8m)，四周是远景 (20m)。
+    Create a synthetic scene specifically for testing EDOF.
+    - RGB: High-frequency grid pattern for observing blur.
+    - Depth: Center is near (0.8m), surroundings are far (20m).
     """
-    # 1. 生成 RGB (高频网格)
-    # 白色背景
+    # 1. Generate RGB (high-frequency grid)
+    # White background
     img_np = np.ones((H, W, 3), dtype=np.float32)
     
-    # 画黑色网格线 (每 16 像素一条)
+    # Draw black grid lines (every 16 pixels)
     grid_size = 16
     for i in range(0, H, grid_size):
         cv2.line(img_np, (0, i), (W, i), (0, 0, 0), 1)
     for j in range(0, W, grid_size):
         cv2.line(img_np, (j, 0), (j, H), (0, 0, 0), 1)
         
-    # 在中间写个字 "NEAR"
+    # Write "NEAR" in the center
     cv2.putText(img_np, "NEAR", (W//2 - 30, H//2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 1), 2)
-    # 在角落写个字 "FAR"
+    # Write "FAR" in the corner
     cv2.putText(img_np, "FAR", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (1, 0, 0), 2)
 
-    # 2. 生成 Depth Map
-    # 默认全是背景 (20m)
+    # 2. Generate Depth Map
+    # Default all to background (20m)
     depth_np = np.ones((H, W), dtype=np.float32) * 20.0
     
-    # 中间区域设置为近景 (0.8m) -> 对应 Channel 0 的焦点
-    # 之前是 1.5m，正好处于 0.8m 和 6.0m 的中间屈光度，导致两边模糊程度一样！
+    # Set center area to near (0.8m) -> matches Channel 0 focus
+    # Previously was 1.5m, exactly between 0.8m and 6.0m diopter, causing equal blur on both sides!
     center_h, center_w = H // 2, W // 2
     size = 60
     depth_np[center_h-size:center_h+size, center_w-size:center_w+size] = 0.8
 
-    # 转换为 Tensor
+    # Convert to Tensor
     img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() # [1, 3, H, W]
     depth_tensor = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).float() # [1, 1, H, W]
     
@@ -48,59 +48,60 @@ def create_synthetic_scene(H=512, W=512):
 def test_pipeline():
     print("--- Starting Pipeline Visual Test ---")
     
-    # 1. 配置 (使用我们优化后的高性能参数)
+    # 1. Configuration (using our optimized high-performance parameters)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
     optics_config = {
         'f_mm': 25.0,
-        'f_number': 2.2,       # 大光圈，确保虚化明显
+        'f_number': 2.2,       # Large aperture, ensure obvious bokeh
         'pixel_size_um': 3.45,
-        'fov_pixels': 128,      # 64 足够看清正方形光斑
+        'fov_pixels': 512,      # 64 is enough to see square bokeh clearly
         'n_zernike': 15,
-        'pupil_grid_size': 256
+        'pupil_grid_size': 1024,
+        'oversample_factor': 4
     }
     
     layer_config = {
-        'num_layers': 30,
-        'min_dist': 0.8,
-        'max_dist': 20.0
+        'num_layers': 10,
+        'min_dist': 1.5,
+        'max_dist': 4.0
     }
 
-    # 2. 初始化 Pipeline
+    # 2. Initialize Pipeline
     pipeline = ImageFormationPipeline(
         optics_config=optics_config, 
         layer_config=layer_config
     ).to(device)
     pipeline.eval()
 
-    # 3. 生成合成数据
+    # 3. Generate synthetic data
     print("Generating synthetic checkerboard scene...")
     rgb, depth = create_synthetic_scene(H=512, W=512)
     rgb = rgb.to(device)
     depth = depth.to(device)
 
-    # 4. 运行仿真
+    # 4. Run simulation
     print(f"Running simulation...")
     print(f"Focus Settings -> Near: {pipeline.d_focus_0:.2f}m, Far: {pipeline.d_focus_90:.2f}m")
     
     with torch.no_grad():
         raw, img_near, img_far = pipeline(rgb, depth)
 
-    # 5. 可视化对比
+    # 5. Visualization comparison
     print("Plotting results...")
     
-    # 转 Numpy 方便画图
+    # Convert to Numpy for plotting
     def to_np(t):
-    # 先把数据移到 CPU 并 detach
+        # First move data to CPU and detach
         x = t.detach().cpu()
     
-    # 如果是 4D 张量 [B, C, H, W]，通常我们需要去掉 Batch 维度
+        # If 4D tensor [B, C, H, W], we need to remove Batch dimension
         if x.dim() == 4:
-            x = x[0]  # 取 Batch 中的第一张图 -> [C, H, W]
-            x = x.permute(1, 2, 0)  # 转为 numpy 图片格式 -> [H, W, C]
+            x = x[0]  # Take first image from batch -> [C, H, W]
+            x = x.permute(1, 2, 0)  # Convert to numpy image format -> [H, W, C]
     
-    # 最后再 squeeze。如果是单通道 [H, W, 1] 会变成 [H, W]；如果是 RGB [H, W, 3] 则保持不变
+        # Finally squeeze. If single channel [H, W, 1] becomes [H, W]; if RGB [H, W, 3] stays unchanged
         return x.squeeze().numpy()
 
     img_in = to_np(rgb)
@@ -110,28 +111,28 @@ def test_pipeline():
 
     plt.figure(figsize=(15, 5))
 
-    # 子图 1: 原始深度
+    # Subplot 1: Original depth
     plt.subplot(1, 4, 1)
     plt.title("Input Depth Map\n(Blue=Near, Yellow=Far)")
-    plt.imshow(depth_in, cmap='plasma_r') # plasma_r 让近处(小数值)偏亮色，远处偏深色，或者反之，看个人喜好
+    plt.imshow(depth_in, cmap='plasma_r') # plasma_r makes near (small values) bright, far dark, or vice versa
     plt.colorbar(fraction=0.046, pad=0.04)
     plt.axis('off')
 
-    # 子图 2: 原始图像
+    # Subplot 2: Original image
     plt.subplot(1, 4, 2)
     plt.title("Input Sharp Image")
     plt.imshow(np.clip(img_in, 0, 1))
     plt.axis('off')
 
-    # 子图 3: 近焦通道输出 (0度)
-    # 预期：中间的 "NEAR" 应该清晰，四周的 "FAR" 和网格应该模糊
+    # Subplot 3: Near focus channel output (0 degree)
+    # Expected: Center "NEAR" should be sharp, surrounding "FAR" and grid should be blurred
     plt.subplot(1, 4, 3)
     plt.title(f"Channel 0 (Near Focus: {pipeline.d_focus_0}m)\nTarget: Center Clear")
     plt.imshow(np.clip(out_near, 0, 1))
     plt.axis('off')
 
-    # 子图 4: 远焦通道输出 (90度)
-    # 预期：四周的 "FAR" 应该清晰，中间的 "NEAR" 应该模糊
+    # Subplot 4: Far focus channel output (90 degree)
+    # Expected: Surrounding "FAR" should be sharp, center "NEAR" should be blurred
     plt.subplot(1, 4, 4)
     plt.title(f"Channel 90 (Far Focus: {pipeline.d_focus_90}m)\nTarget: Edge Clear")
     plt.imshow(np.clip(out_far, 0, 1))

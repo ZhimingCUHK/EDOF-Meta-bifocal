@@ -32,9 +32,9 @@ def test_defocus_sweep():
     # ================= Test Scenario =================
     # Set camera fixed focus at different distances
     focus_dist_0_channel = 0.25
-    focus_dist_90_channel = 2.0
+    focus_dist_90_channel = 2.5
 
-    test_depths = [2.00, 1.25, 1.00, 0.75, 0.50, 0.25]
+    test_depths = [2.5, 2.05, 1.6, 1.15, 0.7, 0.25]
 
     results_0 = []
     results_90 = []
