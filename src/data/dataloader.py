@@ -8,7 +8,7 @@ from torchvision import transforms
 
 def read_pfm(file):
     """
-    专门读取 SceneFlow 数据集的 .pfm 格式视差图
+    Read .pfm format disparity maps specifically for SceneFlow dataset
     """
     with open(file, 'rb') as f:
         color = None
@@ -42,7 +42,7 @@ def read_pfm(file):
         shape = (height, width, 3) if color else (height, width)
 
         data = np.reshape(data, shape)
-        data = np.flipud(data) # PFM 存储是倒置的，需要上下翻转
+        data = np.flipud(data) # PFM storage is upside down, need vertical flip
         
         return data, scale
 
@@ -58,10 +58,12 @@ class SceneFlowDataset(Dataset):
           Range: [0.5, 1000.0]
           Values > 20.0 are preserved to represent background.
     """
-    def __init__(self, data_root, dataset_type='train', image_size=(256, 256), use_random_crop=False):
+    def __init__(self, data_root, dataset_type='train', image_size=(256, 256), use_random_crop=False, target_min_depth=0.1,target_max_depth=0.3):
         super().__init__()
         self.image_size = image_size
         self.use_random_crop = use_random_crop
+        self.target_min_depth = target_min_depth 
+        self.target_max_depth = target_max_depth
 
         if dataset_type == 'train':
             self.img_dir = os.path.join(data_root, 'FlyingThings3D_subset/train/image_clean/right')
@@ -116,58 +118,55 @@ class SceneFlowDataset(Dataset):
             disparity = disparity[:, :, 0]
 
         # =========================================================
-        # 物理一致性转换 (Physical Consistency) + 背景保留
+        # Remapping logic
         # =========================================================
+        mask_inf = np.isinf(disparity) | np.isnan(disparity)
+        if mask_inf.all():
+            return self._return_empty()
         
-        # FlyingThings3D constant: f * B ~= 1050.0
-        F_TIMES_B = 1050.0
-        SCNEN_SCALE = 0.05
-        F_TIMES_B_NEW = F_TIMES_B * SCNEN_SCALE
+        valid_disp = disparity[~mask_inf]
+        if len(valid_disp) == 0:
+            return self._return_empty()
         
-        # 定义截断范围
-        # MIN_DEPTH: 0.5m (太近的物体对于 EDOF 来说是无效干扰，建议过滤)
-        # MAX_DEPTH: 1000.0m (保留背景信息，不要在这里截断到 20m)
-        MIN_DEPTH_M = 0.5
-        MAX_DEPTH_M = 1000.0 
+        min_d = valid_disp.min()
+        max_d = valid_disp.max()
 
-        mask_valid = disparity > 0
-        depth_meters = np.zeros_like(disparity, dtype=np.float32)
-        
-        # Z = f * B / d
-        depth_meters[mask_valid] = F_TIMES_B_NEW / (disparity[mask_valid] + 1e-6)
-        
-        # 处理无效视差（无穷远）
-        depth_meters[~mask_valid] = MAX_DEPTH_M
-        
-        # 截断: 
-        # < 0.5m -> 0.5m (防止除零或过大模糊)
-        # > 1000m -> 1000m (统一视为无穷远背景)
-        depth_meters = np.clip(depth_meters, MIN_DEPTH_M, MAX_DEPTH_M)
+        disparity[mask_inf] = min_d 
 
-        # =========================================================
+        d_norm = (disparity - min_d) / (max_d - min_d + 1e-8)
 
-        # To Tensor
+
+        target_diopter_max = 1.0 / self.target_min_depth
+        target_diopter_min = 1.0 / self.target_max_depth
+
+        target_diopter = d_norm * (target_diopter_max - target_diopter_min) + target_diopter_min
+
+        depth_meters = 1.0 / target_diopter
+
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
         depthmap_tensor = torch.from_numpy(depth_meters).unsqueeze(0).float()
 
-        # Stack for consistent cropping
-        stacked = torch.cat([image_tensor, depthmap_tensor], dim=0)
+        stacked = torch.cat([image_tensor,depthmap_tensor],dim=0)
 
         try:
             cropped = self.transform(stacked)
         except Exception as e:
-            print(f'Error during cropping {file_id}: {e}')
+            print(f"Error during cropping {file_id}:{e}")
             return self._return_empty()
-
-        img_gt = cropped[0:3, :, :]
-        depth_map = cropped[3:4, :, :] # Values can be > 20.0
+        
+        img_gt = cropped[0:3,:,:]
+        depth_map = cropped[3:4,:,:]
 
         return img_gt, img_gt.clone(), depth_map
-    
+
     def _return_empty(self):
-        return (torch.zeros(3, self.image_size[0], self.image_size[1]),
-                torch.zeros(3, self.image_size[0], self.image_size[1]),
-                torch.zeros(1, self.image_size[0], self.image_size[1]))
+
+        return (torch.zeros(3,self.image_size[0],self.image_size[1]),
+                torch.zeros(3,self.image_size[0],self.image_size[1]),
+                torch.zeros(1,self.image_size[0],self.image_size[1]) * self.target_max_depth)
+    
+    
+
 
 if __name__ == "__main__":
     # Test block
@@ -181,11 +180,16 @@ if __name__ == "__main__":
             image_size=(512, 512),
             use_random_crop=True
         )
-        loader = DataLoader(dataset, batch_size=4, shuffle=True)
-        images, _, depths = next(iter(loader))
         
-        print(f"Depth Stats: Min={depths.min().item():.2f}m, Max={depths.max().item():.2f}m")
-        # 如果 Max 接近 1000，说明背景保留成功
-        
+        if len(dataset) > 0:
+            loader = DataLoader(dataset, batch_size=4, shuffle=True)
+            images,_,depths = next(iter(loader))
+
+            print("=== Data Check ===")
+            print(f"Image batch shape: {images.shape}")
+            print(f"Depth batch shape: {depths.shape}")
+            print(f"Depth Range: Min={depths.min().item():.3f}m, Max={depths.max().item():.3f}m")
+
+
     except Exception as e:
-        print(f"Test failed: {e}")
+        print(f"Error during dataset loading: {e}")
