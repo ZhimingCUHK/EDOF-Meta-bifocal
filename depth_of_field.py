@@ -4,11 +4,11 @@ def calculate_dof(focal_length_mm, f_number, focus_dist_mm, pixel_size_um):
     """
     计算景深
     focal_length_mm: 镜头焦距 (25)
-    f_number: 光圈值 (2.8)
-    focus_dist_mm: 对焦距离 (150)
-    pixel_size_um: 像元大小 (3.45)
+    f_number: 光圈值 (2.4)
+    focus_dist_mm: 对焦距离(和焦点区分开) (150)
+    pixel_size_um: sensor像元大小 (3.45)
     """
-    # 定义两种 CoC 标准
+    # 两种 CoC 标准
     coc_strict = pixel_size_um / 1000.0        # 1 pixel (严格物理极限)
     coc_visual = pixel_size_um * 3 / 1000.0    # 3 pixels (视觉可接受范围，类似传统定义)
     
@@ -40,9 +40,9 @@ def calculate_dof(focal_length_mm, f_number, focus_dist_mm, pixel_size_um):
 
 # === Parameter ===
 FOCAL_LENGTH = 25    # mm
-F_NUMBER = 2.8       # 光圈
+F_NUMBER = 2.4       # 光圈
 FOCUS_DISTANCE = 1000 # mm (0.15m) -> 你的微距工况
-PIXEL_SIZE = 12    # um (Sony IMX264)
+PIXEL_SIZE = 3.45    # um 
 
 calculate_dof(FOCAL_LENGTH, F_NUMBER, FOCUS_DISTANCE, PIXEL_SIZE)
 
