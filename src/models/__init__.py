@@ -1,1 +1,1 @@
-from .pipeline import ImageFormationPipeline
+from .pipeline import BlurGenerationPipeline
